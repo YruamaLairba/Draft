@@ -1,4 +1,5 @@
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 
 //type WorkData = f32;
@@ -9,49 +10,65 @@ struct Ports {
     output: Port,
 }
 
-enum Message {
+enum RunMessage {
     Job(Port),
     Terminate,
 }
 
 struct Host {
-    htx: mpsc::Sender<Message>,
-    hrx: mpsc::Receiver<Port>,
+    htx: Option<mpsc::Sender<RunMessage>>,
+    hrx: Option<mpsc::Receiver<Port>>,
     //rx: mpsc::Receiver<f32>,
     run_handle: Option<thread::JoinHandle<()>>,
-    //plugin: Plugin,
+    //work_handle: Option<thread::JoinHandle<()>>,
+    plugin: Arc<Plugin>,
 }
 
 impl Host {
     fn new(plugin: Plugin) -> Self {
-        let (htx, prx) = mpsc::channel::<Message>();
-        let (ptx, hrx) = mpsc::channel::<Port>();
-        let mut tmp = Self {
-            htx,
-            hrx,
+        Self {
+            htx: None,
+            hrx: None,
             run_handle: None,
-            //plugin,
-        };
-        let builder = thread::Builder::new().name(String::from("runner"));
+            //work_handle: None,
+            plugin: Arc::new(plugin),
+        }
+    }
+
+    fn start(&mut self) {
+        let (htx, prx) = mpsc::channel::<RunMessage>();
+        let (ptx, hrx) = mpsc::channel::<Port>();
+
+        let plugin = Arc::clone(&self.plugin);
+        let run_builder = thread::Builder::new().name(String::from("runner"));
         let run_handle = Some(
-            builder
+            run_builder
                 .spawn(move || Self::run_loop(prx, ptx, plugin))
                 .unwrap(),
         );
-        tmp.run_handle = run_handle;
-        tmp
+        self.htx = Some(htx);
+        self.hrx = Some(hrx);
+        self.run_handle = run_handle;
     }
 
-    fn send(&self, input: Port) {
-        self.htx.send(Message::Job(input)).unwrap();
+
+
+    fn send(&mut self, input: Port) {
+        let htx = self.htx.take().unwrap();
+        htx.send(RunMessage::Job(input)).unwrap();
+        self.htx = Some(htx);
     }
 
-    fn recv(&self) -> Port {
-        self.hrx.recv().unwrap()
+    fn recv(&mut self) -> Port {
+        let hrx = self.hrx.take().unwrap();
+        let res = hrx.recv().unwrap();
+        self.hrx = Some(hrx);
+        res
     }
 
     fn join(&mut self) {
-        let _ = self.htx.send(Message::Terminate);
+        let htx = self.htx.take().unwrap();
+        htx.send(RunMessage::Terminate).unwrap();
         println!("join");
         let _ = self.run_handle.take().unwrap().join();
         //if let Some(handle)= self.run_handle {
@@ -60,11 +77,11 @@ impl Host {
         //}
     }
 
-    fn run_loop(rx: mpsc::Receiver<Message>, tx: mpsc::Sender<Port>, mut plugin: Plugin) {
+    fn run_loop(rx: mpsc::Receiver<RunMessage>, tx: mpsc::Sender<Port>, plugin: Arc<Plugin>) {
         loop {
             let re = rx.recv().unwrap();
             match re {
-                Message::Job(port) => {
+                RunMessage::Job(port) => {
                     let mut ports = Ports {
                         input: port,
                         output: [0f32; PORTS_SIZE],
@@ -72,7 +89,7 @@ impl Host {
                     plugin.run(&mut ports);
                     let _ = tx.send(ports.output);
                 }
-                Message::Terminate => break,
+                RunMessage::Terminate => break,
             }
         }
     }
@@ -81,7 +98,7 @@ impl Host {
 struct Plugin {}
 
 impl Plugin {
-    fn run(&mut self, ports: &mut Ports) {
+    fn run(& self, ports: &mut Ports) {
         for (in_frame, out_frame) in Iterator::zip(ports.input.iter(), ports.output.iter_mut()) {
             *out_frame = in_frame * 0.5;
         }
@@ -95,6 +112,7 @@ impl Plugin {
 
 fn main() {
     let mut host = Host::new(Plugin {});
+    host.start();
 
     for i in 0..10 {
         println!("send {}",i);
