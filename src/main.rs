@@ -18,7 +18,6 @@ enum WorkControl {
     Terminate,
 }
 
-
 //feature to schedule work
 struct ScheduleHandler {
     ctl_tx: Arc<Mutex<mpsc::Sender<WorkControl>>>,
@@ -27,8 +26,7 @@ struct ScheduleHandler {
 
 impl ScheduleHandler {
     // For real implementation, i think particular care needed here for reliability
-    fn schedule_work(& self, work_data: WorkData) {
-        // this part may require some compiler hint to avoid some reordering
+    fn schedule_work(&self, work_data: WorkData) {
         let _ = self.data_tx.try_lock().unwrap().send(work_data);
         let _ = self.ctl_tx.try_lock().unwrap().send(WorkControl::Job);
     }
@@ -53,10 +51,10 @@ impl Host {
         }
     }
 
-    fn instanciate_plugin(&mut self,plug_factory: fn(features: Features)-> Option<Plugin>) {
+    fn instanciate_plugin(&mut self, plug_factory: fn(features: Features) -> Option<Plugin>) {
         //build channel communitcation
-        let (main_to_run_tx, main_to_run_rx) = mpsc::channel::<Port>();// main to run thread channel
-        let (run_to_main_tx, run_to_main_rx) = mpsc::channel::<Port>();// run thread to main channel
+        let (main_to_run_tx, main_to_run_rx) = mpsc::channel::<Port>(); // main to run thread channel
+        let (run_to_main_tx, run_to_main_rx) = mpsc::channel::<Port>(); // run thread to main channel
         let (work_ctl_tx, work_ctl_rx) = mpsc::channel::<WorkControl>();
         let (run_to_work_tx, run_to_work_rx) = mpsc::channel::<WorkData>();
         self.main_to_run_tx = Some(main_to_run_tx);
@@ -64,11 +62,13 @@ impl Host {
         let work_ctl_tx = Arc::new(Mutex::new(work_ctl_tx));
         self.work_ctl_tx = Some(Arc::clone(&work_ctl_tx));
         //schedule handler in features
-        let schedule_handler = ScheduleHandler{ 
+        let schedule_handler = ScheduleHandler {
             ctl_tx: work_ctl_tx,
-            data_tx:Mutex::new(run_to_work_tx),
+            data_tx: Mutex::new(run_to_work_tx),
         };
-        let features = Features{ schedule_handler: Some(schedule_handler)};
+        let features = Features {
+            schedule_handler: Some(schedule_handler),
+        };
         //intanciate a plugin
         let plugin = if let Some(plugin) = (plug_factory)(features) {
             plugin
@@ -115,7 +115,13 @@ impl Host {
         {
             self.main_to_run_tx.take().unwrap();
         }
-        self.work_ctl_tx.take().unwrap().lock().unwrap().send(WorkControl::Terminate).unwrap();
+        self.work_ctl_tx
+            .take()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .send(WorkControl::Terminate)
+            .unwrap();
         println!("join");
         let _ = self.run_handle.take().unwrap().join();
         let _ = self.work_handle.take().unwrap().join();
@@ -136,6 +142,7 @@ impl Host {
     }
 
     // work context from the host side
+    // For real implementation, i think particular care needed here for reliability
     fn work_loop(
         work_ctl_rx: mpsc::Receiver<WorkControl>,
         run_to_work_rx: mpsc::Receiver<WorkData>,
@@ -143,22 +150,20 @@ impl Host {
     ) {
         while let Ok(ctl) = work_ctl_rx.recv() {
             match ctl {
-                WorkControl::Job => {
-                    match run_to_work_rx.try_recv() {
-                        Ok(data) => {plugin.work(data);}
-                        Err(error) => {
-                            match error {
-                                TryRecvError::Empty => {
-                                    panic!("Error, can't get data");
-                                }
-                                TryRecvError::Disconnected => {
-                                    println!("work_loop terminate, channel disconnected");
-                                    break;
-                                }
-                            }
-                        }
+                WorkControl::Job => match run_to_work_rx.try_recv() {
+                    Ok(data) => {
+                        plugin.work(data);
                     }
-                }
+                    Err(error) => match error {
+                        TryRecvError::Empty => {
+                            panic!("Error, can't get data");
+                        }
+                        TryRecvError::Disconnected => {
+                            println!("work_loop terminate, channel disconnected");
+                            break;
+                        }
+                    },
+                },
                 WorkControl::Terminate => {
                     println!("work_loop terminate");
                     break;
@@ -168,17 +173,27 @@ impl Host {
     }
 }
 
-
-
-
+// --- Plugin part ---
 
 //features
 struct Features {
     schedule_handler: Option<ScheduleHandler>,
 }
 
-struct Plugin {
+// Plugin implementor can group field meant to be used in run context
+struct RunField {
     schedule_handler: ScheduleHandler,
+    tx: mpsc::SyncSender<f32>,
+}
+
+//Plugin implementor can group field meant to be used in work context
+struct WorkField {
+    rx: mpsc::Receiver<f32>,
+}
+
+struct Plugin {
+    run_field: Mutex<RunField>,
+    work_field: Mutex<WorkField>,
 }
 
 impl Plugin {
@@ -188,20 +203,48 @@ impl Plugin {
         } else {
             return None;
         };
-        Some(Self { schedule_handler })
+        let (tx, rx) = mpsc::sync_channel::<f32>(44100);
+        let run_field = Mutex::new(RunField {
+            schedule_handler,
+            tx,
+        });
+        let work_field = Mutex::new(WorkField { rx });
+        Some(Self {
+            run_field,
+            work_field,
+        })
     }
 
     fn run(&self, ports: &mut Ports) {
+        // try to get the lock without blocking. This can never fail if i use it always in the same
+        // context
+        let run_field = if let Ok(run_field) = self.run_field.try_lock() {
+            run_field
+        } else {
+            panic!("Can't lock run_field while it's not supposed to happen");
+        };
+
         for (in_frame, out_frame) in Iterator::zip(ports.input.iter(), ports.output.iter_mut()) {
             *out_frame = in_frame * 0.5;
         }
         println!("run {:?}", &ports.input[0..10]);
         println!("schedule work");
-        self.schedule_handler.schedule_work(12.34);
+        run_field.schedule_handler.schedule_work(12.34);
+        let _ = run_field.tx.try_send(43.21);
     }
 
     fn work(&self, data: WorkData) {
-        println!("worker thread: {:?}", data);
+        // try to get the lock without blocking. This can never fail if i use it always in the same
+        // context
+        let work_field = if let Ok(work_field) = self.work_field.try_lock() {
+            work_field
+        } else {
+            panic!("Can't lock work_field while it's not supposed to happen");
+        };
+
+        println!("worker thread, through host : {:?}", data);
+        let data2 = work_field.rx.recv().unwrap();
+        println!("worker thread, custom channel : {:?}", data2);
     }
 }
 
