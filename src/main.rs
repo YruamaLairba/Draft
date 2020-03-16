@@ -22,6 +22,18 @@ enum WorkMessage {
     Terminate,
 }
 
+
+//feature to schedule work
+struct ScheduleHandler {
+    tx: Arc<Mutex<mpsc::Sender<WorkMessage>>>,
+}
+
+impl ScheduleHandler {
+    fn schedule_work(& self, work_data: WorkData) {
+        let _ = self.tx.lock().unwrap().send(WorkMessage::Job(work_data));
+    }
+}
+
 struct Host {
     run_htx: Option<mpsc::Sender<RunMessage>>,
     run_hrx: Option<mpsc::Receiver<Port>>,
@@ -101,7 +113,10 @@ impl Host {
     }
 
     fn join(&mut self) {
-        self.run_htx.take().unwrap().send(RunMessage::Terminate).unwrap();
+        //Drop the send part of the channel to stop run loop
+        {
+            self.run_htx.take().unwrap();
+        }
         self.work_htx.take().unwrap().lock().unwrap().send(WorkMessage::Terminate).unwrap();
         println!("join");
         let _ = self.run_handle.take().unwrap().join();
@@ -111,9 +126,9 @@ impl Host {
         //}
     }
 
+    // run context from the host side
     fn run_loop(rx: mpsc::Receiver<RunMessage>, tx: mpsc::Sender<Port>, plugin: Arc<Plugin>) {
-        loop {
-            let re = rx.recv().unwrap();
+        while let Ok(re) = rx.recv() {
             match re {
                 RunMessage::Job(port) => {
                     let mut ports = Ports {
@@ -129,8 +144,10 @@ impl Host {
                 }
             }
         }
+        println!("run_loop terminate, channel destroyed");
     }
 
+    // work context from the host side
     fn work_loop(
         rx: mpsc::Receiver<WorkMessage>,
         _tx: mpsc::Sender<WorkData>,
@@ -151,16 +168,7 @@ impl Host {
     }
 }
 
-//feature to schedule work
-struct ScheduleHandler {
-    tx: Arc<Mutex<mpsc::Sender<WorkMessage>>>,
-}
 
-impl ScheduleHandler {
-    fn schedule_work(& self, work_data: WorkData) {
-        let _ = self.tx.lock().unwrap().send(WorkMessage::Job(work_data));
-    }
-}
 
 //features
 struct Features {
