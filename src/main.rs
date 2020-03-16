@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use std::sync::mpsc;
+use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
@@ -12,61 +12,62 @@ struct Ports {
     output: Port,
 }
 
-enum WorkMessage {
-    Job(WorkData),
+// Command to control Work thread
+enum WorkControl {
+    Job,
     Terminate,
 }
 
 
 //feature to schedule work
 struct ScheduleHandler {
-    tx: Arc<Mutex<mpsc::Sender<WorkMessage>>>,
+    ctl_tx: Arc<Mutex<mpsc::Sender<WorkControl>>>,
+    data_tx: Mutex<mpsc::Sender<WorkData>>,
 }
 
 impl ScheduleHandler {
+    // For real implementation, i think particular care needed here for reliability
     fn schedule_work(& self, work_data: WorkData) {
-        let _ = self.tx.lock().unwrap().send(WorkMessage::Job(work_data));
+        // this part may require some compiler hint to avoid some reordering
+        let _ = self.data_tx.try_lock().unwrap().send(work_data);
+        let _ = self.ctl_tx.try_lock().unwrap().send(WorkControl::Job);
     }
 }
 
 struct Host {
-    run_htx: Option<mpsc::Sender<Port>>,
-    run_hrx: Option<mpsc::Receiver<Port>>,
+    main_to_run_tx: Option<mpsc::Sender<Port>>,
+    run_to_main_rx: Option<mpsc::Receiver<Port>>,
     run_handle: Option<thread::JoinHandle<()>>,
-    work_htx: Option<Arc<Mutex<mpsc::Sender<WorkMessage>>>>,
-    work_hrx: Option<mpsc::Receiver<WorkData>>,
-    //rx: mpsc::Receiver<f32>,
+    work_ctl_tx: Option<Arc<Mutex<mpsc::Sender<WorkControl>>>>,
     work_handle: Option<thread::JoinHandle<()>>,
-    plugin: Option<Arc<Plugin>>,
 }
 
 impl Host {
     fn new() -> Self {
         Self {
-            run_htx: None,
-            run_hrx: None,
+            main_to_run_tx: None,
+            run_to_main_rx: None,
             run_handle: None,
-            work_htx: None,
-            work_hrx: None,
+            work_ctl_tx: None,
             work_handle: None,
-            plugin: None,
         }
     }
 
     fn instanciate_plugin(&mut self,plug_factory: fn(features: Features)-> Option<Plugin>) {
         //build channel communitcation
-        let (run_htx, run_prx) = mpsc::channel::<Port>();
-        let (run_ptx, run_hrx) = mpsc::channel::<Port>();
-        let (work_htx, work_prx) = mpsc::channel::<WorkMessage>();
-        let (work_ptx, work_hrx) = mpsc::channel::<WorkData>();
-        let work_htx = Arc::new(Mutex::new(work_htx));
-        let work_htx_ref2 = work_htx.clone();
-        self.run_htx = Some(run_htx);
-        self.run_hrx = Some(run_hrx);
-        self.work_htx = Some(work_htx);
-        self.work_hrx = Some(work_hrx);
+        let (main_to_run_tx, main_to_run_rx) = mpsc::channel::<Port>();// main to run thread channel
+        let (run_to_main_tx, run_to_main_rx) = mpsc::channel::<Port>();// run thread to main channel
+        let (work_ctl_tx, work_ctl_rx) = mpsc::channel::<WorkControl>();
+        let (run_to_work_tx, run_to_work_rx) = mpsc::channel::<WorkData>();
+        self.main_to_run_tx = Some(main_to_run_tx);
+        self.run_to_main_rx = Some(run_to_main_rx);
+        let work_ctl_tx = Arc::new(Mutex::new(work_ctl_tx));
+        self.work_ctl_tx = Some(Arc::clone(&work_ctl_tx));
         //schedule handler in features
-        let schedule_handler = ScheduleHandler{ tx:work_htx_ref2};
+        let schedule_handler = ScheduleHandler{ 
+            ctl_tx: work_ctl_tx,
+            data_tx:Mutex::new(run_to_work_tx),
+        };
         let features = Features{ schedule_handler: Some(schedule_handler)};
         //intanciate a plugin
         let plugin = if let Some(plugin) = (plug_factory)(features) {
@@ -75,50 +76,49 @@ impl Host {
             println!("Can't instanciate plugin");
             return;
         };
+
         let plugin_ref1 = Arc::new(plugin);
         let plugin_ref2 = Arc::clone(&plugin_ref1);
-        let run_builder = thread::Builder::new().name(String::from("runner"));
-        let run_handle = Some(
-            run_builder
-                .spawn(move || Self::run_loop(run_prx, run_ptx, plugin_ref1))
-                .unwrap(),
-        );
-        self.run_handle = run_handle;
 
-        let work_builder = thread::Builder::new().name(String::from("worker"));
-        let work_handle = Some(
-            work_builder
-                .spawn(move || Self::work_loop(work_prx, work_ptx, plugin_ref2))
+        // Build and start the run thread
+        let run_builder = thread::Builder::new().name(String::from("runner"));
+        self.run_handle = Some(
+            run_builder
+                .spawn(move || Self::run_loop(main_to_run_rx, run_to_main_tx, plugin_ref1))
                 .unwrap(),
         );
-        self.work_handle = work_handle;
+
+        // Build and start the work thread
+        let work_builder = thread::Builder::new().name(String::from("worker"));
+        self.work_handle = Some(
+            work_builder
+                .spawn(move || Self::work_loop(work_ctl_rx, run_to_work_rx, plugin_ref2))
+                .unwrap(),
+        );
     }
 
     fn send(&mut self, input: Port) {
-        let htx = self.run_htx.take().unwrap();
+        let htx = self.main_to_run_tx.take().unwrap();
         htx.send(input).unwrap();
-        self.run_htx = Some(htx);
+        self.main_to_run_tx = Some(htx);
     }
 
     fn recv(&mut self) -> Port {
-        let hrx = self.run_hrx.take().unwrap();
+        let hrx = self.run_to_main_rx.take().unwrap();
         let res = hrx.recv().unwrap();
-        self.run_hrx = Some(hrx);
+        self.run_to_main_rx = Some(hrx);
         res
     }
 
     fn join(&mut self) {
         //Drop the send part of the channel to stop run loop
         {
-            self.run_htx.take().unwrap();
+            self.main_to_run_tx.take().unwrap();
         }
-        self.work_htx.take().unwrap().lock().unwrap().send(WorkMessage::Terminate).unwrap();
+        self.work_ctl_tx.take().unwrap().lock().unwrap().send(WorkControl::Terminate).unwrap();
         println!("join");
         let _ = self.run_handle.take().unwrap().join();
-        //if let Some(handle)= self.run_handle {
-        //    self.run_handle = None;
-        //    handle.join();
-        //}
+        let _ = self.work_handle.take().unwrap().join();
     }
 
     // run context from the host side
@@ -137,17 +137,29 @@ impl Host {
 
     // work context from the host side
     fn work_loop(
-        rx: mpsc::Receiver<WorkMessage>,
-        _tx: mpsc::Sender<WorkData>,
+        work_ctl_rx: mpsc::Receiver<WorkControl>,
+        run_to_work_rx: mpsc::Receiver<WorkData>,
         plugin: Arc<Plugin>,
     ) {
-        loop {
-            let re = rx.recv().unwrap();
-            match re {
-                WorkMessage::Job(work_data) => {
-                    plugin.work(work_data);
+        while let Ok(ctl) = work_ctl_rx.recv() {
+            match ctl {
+                WorkControl::Job => {
+                    match run_to_work_rx.try_recv() {
+                        Ok(data) => {plugin.work(data);}
+                        Err(error) => {
+                            match error {
+                                TryRecvError::Empty => {
+                                    panic!("Error, can't get data");
+                                }
+                                TryRecvError::Disconnected => {
+                                    println!("work_loop terminate, channel disconnected");
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
-                WorkMessage::Terminate => {
+                WorkControl::Terminate => {
                     println!("work_loop terminate");
                     break;
                 }
@@ -155,6 +167,8 @@ impl Host {
         }
     }
 }
+
+
 
 
 
