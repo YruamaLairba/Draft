@@ -12,11 +12,6 @@ struct Ports {
     output: Port,
 }
 
-enum RunMessage {
-    Job(Port),
-    Terminate,
-}
-
 enum WorkMessage {
     Job(WorkData),
     Terminate,
@@ -35,7 +30,7 @@ impl ScheduleHandler {
 }
 
 struct Host {
-    run_htx: Option<mpsc::Sender<RunMessage>>,
+    run_htx: Option<mpsc::Sender<Port>>,
     run_hrx: Option<mpsc::Receiver<Port>>,
     run_handle: Option<thread::JoinHandle<()>>,
     work_htx: Option<Arc<Mutex<mpsc::Sender<WorkMessage>>>>,
@@ -60,7 +55,7 @@ impl Host {
 
     fn instanciate_plugin(&mut self,plug_factory: fn(features: Features)-> Option<Plugin>) {
         //build channel communitcation
-        let (run_htx, run_prx) = mpsc::channel::<RunMessage>();
+        let (run_htx, run_prx) = mpsc::channel::<Port>();
         let (run_ptx, run_hrx) = mpsc::channel::<Port>();
         let (work_htx, work_prx) = mpsc::channel::<WorkMessage>();
         let (work_ptx, work_hrx) = mpsc::channel::<WorkData>();
@@ -101,7 +96,7 @@ impl Host {
 
     fn send(&mut self, input: Port) {
         let htx = self.run_htx.take().unwrap();
-        htx.send(RunMessage::Job(input)).unwrap();
+        htx.send(input).unwrap();
         self.run_htx = Some(htx);
     }
 
@@ -127,22 +122,15 @@ impl Host {
     }
 
     // run context from the host side
-    fn run_loop(rx: mpsc::Receiver<RunMessage>, tx: mpsc::Sender<Port>, plugin: Arc<Plugin>) {
-        while let Ok(re) = rx.recv() {
-            match re {
-                RunMessage::Job(port) => {
-                    let mut ports = Ports {
-                        input: port,
-                        output: [0f32; PORTS_SIZE],
-                    };
-                    plugin.run(&mut ports);
-                    let _ = tx.send(ports.output);
-                }
-                RunMessage::Terminate => {
-                    println!("run_loop terminate");
-                    break;
-                }
-            }
+    fn run_loop(rx: mpsc::Receiver<Port>, tx: mpsc::Sender<Port>, plugin: Arc<Plugin>) {
+        // the while loop breaks when there is no data and when the send side have been dropped
+        while let Ok(input_port) = rx.recv() {
+            let mut ports = Ports {
+                input: input_port,
+                output: [0f32; PORTS_SIZE],
+            };
+            plugin.run(&mut ports);
+            let _ = tx.send(ports.output);
         }
         println!("run_loop terminate, channel destroyed");
     }
